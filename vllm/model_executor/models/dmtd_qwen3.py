@@ -78,7 +78,6 @@ class DMTDQwen3DecoderLayer(Qwen3DecoderLayer):
         cache_config=None,
         quant_config=None,
         prefix: str = "",
-        per_layer_sliding_window: int | None = None,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
@@ -99,7 +98,6 @@ class DMTDQwen3DecoderLayer(Qwen3DecoderLayer):
             dual_chunk_attention_config=getattr(
                 config, "dual_chunk_attention_config", None
             ),
-            per_layer_sliding_window=per_layer_sliding_window,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,

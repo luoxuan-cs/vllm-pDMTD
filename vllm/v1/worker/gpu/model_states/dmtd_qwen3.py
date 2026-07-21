@@ -17,7 +17,24 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
+
+
+@dataclass
+class _ParallelIsPrefillingAttnMetadata(ModelSpecificAttnMetadata):
+    """Forces every segmented parallel-layer forward to build prefill-shaped
+    attention metadata, since each segment always processes fresh MASK/refresh
+    tokens rather than a single decode step."""
+
+    is_prefilling: torch.Tensor
+
+    def get_extra_common_attn_kwargs(
+        self,
+        kv_cache_group_id: int,
+        num_reqs: int,
+    ) -> dict[str, Any]:
+        return {"is_prefilling": self.is_prefilling[:num_reqs]}
 
 
 @dataclass
@@ -507,9 +524,11 @@ class DMTDQwen3ModelState(DefaultModelState):
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
             positions=positions_t,
-            is_prefilling=torch.tensor(
-                [True] * len(req_batch_indices),
-                dtype=torch.bool,
+            model_specific_attn_metadata=_ParallelIsPrefillingAttnMetadata(
+                is_prefilling=torch.tensor(
+                    [True] * len(req_batch_indices),
+                    dtype=torch.bool,
+                ),
             ),
             for_cudagraph_capture=for_capture,
             metadata_builder_idx=1,
