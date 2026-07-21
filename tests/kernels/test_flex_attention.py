@@ -318,6 +318,76 @@ def test_block_mask_direct_vs_slow_path():
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or TORCH_VERSION < MINIMUM_TORCH_VERSION,
+    reason="CUDA not available or PyTorch version < 2.7",
+)
+def test_owned_metadata_survives_subsequent_build():
+    """A retained metadata snapshot must not observe builder buffer reuse."""
+    device = torch.device("cuda")
+    vllm_config = create_vllm_config(
+        model_name="facebook/opt-125m",
+        block_size=16,
+        max_model_len=128,
+        num_gpu_blocks=16,
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    builder = FlexAttentionMetadataBuilder(kv_cache_spec, [], vllm_config, device)
+
+    first_common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[64], query_lens=[4], name="retained"),
+        vllm_config.cache_config.block_size,
+        device,
+        arange_block_indices=True,
+    )
+    first = builder.build(
+        common_prefix_len=0, common_attn_metadata=first_common
+    ).make_owned_copy()
+
+    tensor_snapshots = {
+        "physical_to_logical": first.physical_to_logical.clone(),
+        "decode_offset": first.decode_offset.clone(),
+        "doc_ids": first.doc_ids.clone(),
+        "kv_indices": first.block_mask.kv_indices.clone(),
+        "kv_num_blocks": first.block_mask.kv_num_blocks.clone(),
+    }
+    scalar = torch.tensor(0, device=device)
+    q_idx = torch.tensor(0, device=device)
+    # Physical token 48 belongs to the fourth block of the retained sequence.
+    physical_kv_idx = torch.tensor(48, device=device)
+    visible_before = first.block_mask.mask_mod(
+        scalar, scalar, q_idx, physical_kv_idx
+    ).clone()
+    assert visible_before.item()
+
+    assert first.physical_to_logical.data_ptr() != (
+        builder.persistent_physical_to_logical.data_ptr()
+    )
+    assert first.decode_offset.data_ptr() != builder.persistent_offset_tensor.data_ptr()
+    assert first.doc_ids.data_ptr() != builder.persistent_doc_ids.data_ptr()
+    assert first.persistent_kv_indices.data_ptr() != (
+        builder.persistent_kv_indices.data_ptr()
+    )
+
+    second_common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[16], query_lens=[16], name="overwrite"),
+        vllm_config.cache_config.block_size,
+        device,
+        arange_block_indices=True,
+    )
+    builder.build(common_prefix_len=0, common_attn_metadata=second_common)
+
+    for name, expected in tensor_snapshots.items():
+        actual = (
+            getattr(first.block_mask, name)
+            if name in {"kv_indices", "kv_num_blocks"}
+            else getattr(first, name)
+        )
+        assert torch.equal(actual, expected), name
+    visible_after = first.block_mask.mask_mod(scalar, scalar, q_idx, physical_kv_idx)
+    assert torch.equal(visible_after, visible_before)
+
+
 def test_physical_to_logical_mapping_handles_reused_blocks():
     """Regression test: reused physical blocks map to the latest logical block.
 

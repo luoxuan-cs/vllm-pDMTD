@@ -809,11 +809,84 @@ class VoyageQwen3BidirectionalEmbedModelConfig(VerifyAndUpdateConfig):
         model_config.hf_config.embedding_size = model_config.hf_config.num_labels
 
 
+class DMTDQwen3ForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
+        if (
+            hf_config.num_parallel_layers != 28
+            or hf_config.num_sequential_layers != 8
+            or hf_config.num_hidden_layers != 36
+            or hf_config.mtp_horizon != 4
+        ):
+            raise ValueError(
+                "DMTDQwen3 requires the 28 parallel / 8 sequential layer, "
+                "tau=4 configuration."
+            )
+        block_attention = getattr(hf_config, "dmtd_block_attention", "causal")
+        if block_attention == "bidirectional":
+            attention_config = vllm_config.attention_config
+            if attention_config.backend not in (
+                None,
+                AttentionBackendEnum.FLEX_ATTENTION,
+            ):
+                raise ValueError(
+                    "DMTDQwen3 bidirectional block attention requires the "
+                    "FLEX_ATTENTION backend."
+                )
+            attention_config.backend = AttentionBackendEnum.FLEX_ATTENTION
+            # Only the parallel-layer shadow metadata installs a non-causal,
+            # same-cycle logical mask. The sequential layers must remain
+            # causal for normal autoregressive decoding, so do not switch the
+            # model-wide attention mode.
+            attention_config.use_non_causal = False
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "DMTDQwen3 uses the normal sampler and does not support "
+                "speculative decoding."
+            )
+        if vllm_config.quant_config is not None:
+            raise ValueError(
+                "DMTDQwen3 quantized weight formats are not validated yet."
+            )
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError("DMTDQwen3 does not support prefix caching.")
+        if vllm_config.parallel_config.pipeline_parallel_size != 1:
+            raise ValueError("DMTDQwen3 does not support pipeline parallelism.")
+        if (
+            vllm_config.parallel_config.decode_context_parallel_size != 1
+            or vllm_config.parallel_config.prefill_context_parallel_size != 1
+        ):
+            raise ValueError("DMTDQwen3 does not support context parallelism.")
+        if vllm_config.parallel_config.enable_dbo:
+            raise ValueError("DMTDQwen3 does not support dual batch overlap.")
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_connector is not None
+        ):
+            raise ValueError("DMTDQwen3 does not support KV connectors.")
+        if vllm_config.scheduler_config.async_scheduling:
+            raise ValueError("DMTDQwen3 does not support async scheduling.")
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError("DMTDQwen3 requires the V2 model runner.")
+
+        model_config.enforce_eager = True
+        compilation_config = vllm_config.compilation_config
+        compilation_config.mode = CompilationMode.NONE
+        compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
+    "DMTDQwen3ForCausalLM": DMTDQwen3ForCausalLMConfig,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,

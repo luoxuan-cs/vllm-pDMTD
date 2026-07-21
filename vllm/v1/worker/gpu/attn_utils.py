@@ -141,11 +141,16 @@ def init_attn_backend(
         if kv_cache_group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
+            num_metadata_builders = (
+                2
+                if vllm_config.model_config.architecture == "DMTDQwen3ForCausalLM"
+                else 1
+            )
             group.create_metadata_builders(
                 vllm_config=vllm_config,
                 device=device,
                 kernel_block_size=kernel_block_size,
-                num_metadata_builders=1,
+                num_metadata_builders=num_metadata_builders,
             )
             builder = group.get_metadata_builder(0)
             if attn_backend_workspace is None:
@@ -575,6 +580,7 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    metadata_builder_idx: int = 0,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -613,7 +619,9 @@ def build_attn_metadata(
         )
 
         for attn_group in attn_groups[i]:
-            attn_metadata_builder = attn_group.get_metadata_builder(0)
+            attn_metadata_builder = attn_group.get_metadata_builder(
+                metadata_builder_idx
+            )
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata

@@ -268,6 +268,21 @@ class FlashAttentionMetadata:
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
 
+    def make_owned_copy(self) -> "FlashAttentionMetadata":
+        """Detach retained metadata from the builder's reusable buffers.
+
+        Segmented callers such as DMTD build several metadata objects before
+        executing their forwards. The normal builder output contains tensor
+        views into persistent workspaces, so a later build can otherwise
+        overwrite an earlier segment's sequence lengths, block table, or slot
+        mapping.
+        """
+        owned = copy.copy(self)
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                setattr(owned, name, value.clone())
+        return owned
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,

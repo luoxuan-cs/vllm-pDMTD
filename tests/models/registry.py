@@ -498,6 +498,12 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     ),
     "Qwen2MoeForCausalLM": _HfExamplesInfo("Qwen/Qwen1.5-MoE-A2.7B-Chat"),
     "Qwen3ForCausalLM": _HfExamplesInfo("Qwen/Qwen3-8B"),
+    "DMTDQwen3ForCausalLM": _HfExamplesInfo(
+        "xuan-luo/DMTD-Qwen3-4B",
+        trust_remote_code=True,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+    ),
     "Qwen3MoeForCausalLM": _HfExamplesInfo("Qwen/Qwen3-30B-A3B"),
     "MellumForCausalLM": _HfExamplesInfo("JetBrains/Mellum2-12B-A2.5B-Base"),
     "Qwen3NextForCausalLM": _HfExamplesInfo(

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlexAttention."""
 
+import copy
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -845,6 +846,56 @@ class FlexAttentionMetadata:
 
         self.mask_mod = self.get_mask_mod()
         self.transformed_score_mod = self.get_transformed_score_mod()
+
+    def make_owned_copy(self) -> "FlexAttentionMetadata":
+        """Copy metadata that must outlive the builder's next ``build``.
+
+        Builders normally return views into persistent buffers so CUDA graph
+        replay sees stable addresses. Some callers, notably segmented DMTD
+        parallel-layer forwards, retain several metadata objects from
+        consecutive builds and use them later in one forward. Such retained
+        metadata must own both the tensors read by its mask closures and its
+        BlockMask tensors.
+        """
+        owned = copy.copy(self)
+
+        # Clone all per-build tensor state except the oversized builder
+        # workspaces. This includes physical_to_logical and decode_offset,
+        # which are slices of builder-owned persistent buffers.
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor) and not name.startswith("persistent_"):
+                setattr(owned, name, value.clone())
+
+        if owned.doc_ids is not None:
+            # Keep the same aliasing contract as __post_init__, but with
+            # storage owned by this metadata object.
+            owned.persistent_doc_ids = owned.doc_ids
+        else:
+            owned.persistent_doc_ids = self.persistent_doc_ids[
+                : self.num_actual_tokens
+            ].clone()
+
+        owned.mask_mod = owned.get_mask_mod()
+        owned.transformed_score_mod = owned.get_transformed_score_mod()
+
+        if self.block_mask is None:
+            # build() currently always pre-builds this. Keep a defensive
+            # fallback for metadata constructed directly in tests/extensions.
+            owned.persistent_kv_indices = self.persistent_kv_indices.clone()
+            owned.persistent_kv_num_blocks = self.persistent_kv_num_blocks.clone()
+            return owned
+
+        owned.block_mask = copy.copy(self.block_mask)
+        for name, value in vars(self.block_mask).items():
+            if isinstance(value, torch.Tensor):
+                setattr(owned.block_mask, name, value.clone())
+        owned.block_mask.mask_mod = owned.mask_mod
+
+        # A direct rebuild only needs the used BlockMask-sized workspaces, not
+        # the builder's maximum-size allocations.
+        owned.persistent_kv_indices = owned.block_mask.kv_indices[0, 0]
+        owned.persistent_kv_num_blocks = owned.block_mask.kv_num_blocks[0, 0]
+        return owned
 
 
 class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadata]):

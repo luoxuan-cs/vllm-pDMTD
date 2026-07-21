@@ -190,6 +190,7 @@ _TEXT_GENERATION_MODELS = {
     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeForCausalLM"),
+    "DMTDQwen3ForCausalLM": ("dmtd_qwen3", "DMTDQwen3ForCausalLM"),
     "RWForCausalLM": ("falcon", "FalconForCausalLM"),
     "SarvamMoEForCausalLM": ("sarvam", "SarvamMoEForCausalLM"),
     "SarvamMLAForCausalLM": ("sarvam", "SarvamMLAForCausalLM"),
