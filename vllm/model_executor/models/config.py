@@ -499,7 +499,7 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             "last": "LAST",
         }
 
-        pooling_type = pooling_type_map.get(hf_config.pooling, None)
+        pooling_type = pooling_type_map.get(hf_config.pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 
@@ -813,37 +813,24 @@ class DMTDQwen3ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CompilationMode, CUDAGraphMode
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        if (
-            hf_config.num_parallel_layers != 28
-            or hf_config.num_sequential_layers != 8
-            or hf_config.num_hidden_layers != 36
-            or hf_config.mtp_horizon != 4
-        ):
-            raise ValueError(
-                "DMTDQwen3 requires the 28 parallel / 8 sequential layer, "
-                "tau=4 configuration."
-            )
+        # Layer-split and mtp_horizon invariants (num_parallel_layers +
+        # num_sequential_layers == num_hidden_layers, mtp_horizon >= 1, ...)
+        # are already validated by DMTDQwen3Config.__post_init__ when the
+        # checkpoint's config.json is loaded, so they are not re-checked
+        # here against any particular numeric layout.
         block_attention = getattr(hf_config, "dmtd_block_attention", "causal")
         if block_attention == "bidirectional":
-            attention_config = vllm_config.attention_config
-            if attention_config.backend not in (
-                None,
-                AttentionBackendEnum.FLEX_ATTENTION,
-            ):
-                raise ValueError(
-                    "DMTDQwen3 bidirectional block attention requires the "
-                    "FLEX_ATTENTION backend."
-                )
-            attention_config.backend = AttentionBackendEnum.FLEX_ATTENTION
-            # Only the parallel-layer shadow metadata installs a non-causal,
-            # same-cycle logical mask. The sequential layers must remain
-            # causal for normal autoregressive decoding, so do not switch the
-            # model-wide attention mode.
-            attention_config.use_non_causal = False
+            # The current-cycle shadow block needs a plain `causal=False`
+            # attention call (see DMTDQwen3ModelState's `noncausal` group);
+            # this is the same native, per-request-isolated mechanism
+            # DFlash/DSpark already use
+            # (vllm/v1/worker/gpu/spec_decode/dspark/utils.py), backed by
+            # FlashAttentionBackend.supports_non_causal() -> True. No custom
+            # attention backend is required.
+            vllm_config.attention_config.use_non_causal = True
         if vllm_config.speculative_config is not None:
             raise ValueError(
                 "DMTDQwen3 uses the normal sampler and does not support "
@@ -870,15 +857,33 @@ class DMTDQwen3ForCausalLMConfig(VerifyAndUpdateConfig):
             and kv_transfer_config.kv_connector is not None
         ):
             raise ValueError("DMTDQwen3 does not support KV connectors.")
-        if vllm_config.scheduler_config.async_scheduling:
-            raise ValueError("DMTDQwen3 does not support async scheduling.")
+        # Async scheduling is supported: the cycle planners decide purely from
+        # token *positions* (local_pos = pos - prompt_len, phase, and the
+        # refresh lag), never from token *values*, and the one place that does
+        # need token values -- the shadow/refresh block's real ids -- reads them
+        # from the GPU-resident history in
+        # DMTDQwen3ModelState._gather_group_ids, exactly like the vanilla path
+        # reads the newest sampled token off the GPU.
         if not vllm_config.use_v2_model_runner:
             raise ValueError("DMTDQwen3 requires the V2 model runner.")
 
-        model_config.enforce_eager = True
         compilation_config = vllm_config.compilation_config
+        # torch.compile stays off: DMTD's forward runs up to three
+        # parallel-layer sub-forwards whose shapes are decided per step, and
+        # swaps each one's attention metadata into the live forward context --
+        # neither is expressible under `fullgraph=True` with guards dropped.
         compilation_config.mode = CompilationMode.NONE
-        compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        if model_config.enforce_eager:
+            # The user asked for eager explicitly; leave graphs off.
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        else:
+            # Full CUDA graphs are captured for uniform-decode batches only,
+            # and DMTDQwen3ModelState.requires_eager_step additionally forces
+            # eager on any step that needs parallel-layer work, so the only
+            # shape that ever replays is the mid-cycle decode one (sequential
+            # layers only). FULL_DECODE_ONLY contains no PIECEWISE mode, so it
+            # does not require the piecewise compilation we just disabled.
+            compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {

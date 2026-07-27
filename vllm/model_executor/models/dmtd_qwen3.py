@@ -10,7 +10,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -177,29 +176,23 @@ class DMTDQwen3Model(nn.Module):
         assert residual is not None
         return hidden_states, residual
 
-    def _set_parallel_context(
-        self,
-        *,
-        slot_mapping: torch.Tensor | None,
-        attn_metadata: dict[str, Any] | None = None,
-    ) -> None:
-        context = get_forward_context()
-        for layer in self.layers[: self.num_parallel_layers]:
-            layer_name = layer.self_attn.attn.layer_name
-            if attn_metadata is not None:
-                context.attn_metadata[layer_name] = attn_metadata[layer_name]
-            if slot_mapping is not None:
-                context.slot_mapping[layer_name] = slot_mapping
-
-    def _run_parallel_layers(
+    def run_parallel_group(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         *,
-        slot_mapping: torch.Tensor | None,
-        attn_metadata: dict[str, Any] | None = None,
-    ) -> torch.Tensor:
-        self._set_parallel_context(slot_mapping=slot_mapping, attn_metadata=attn_metadata)
+        out: torch.Tensor,
+    ) -> None:
+        """Run the parallel layers over one attention group's rows.
+
+        The caller owns the forward context, so this is a separate entry point
+        from `forward` rather than a branch inside it: one group's rows are a
+        uniform ``num_reqs x rows_per_request`` batch that can be captured as
+        its own CUDA graph, while `forward` covers the sequential layers.
+
+        `out` is a slice of the caller's persistent parallel-output table, so
+        the result never needs a fresh allocation.
+        """
         hidden = self.embed_input_ids(input_ids)
         hidden, residual = self._run_layers(
             0,
@@ -207,7 +200,7 @@ class DMTDQwen3Model(nn.Module):
             positions,
             hidden,
         )
-        return hidden + residual
+        torch.add(hidden, residual, out=out)
 
     def forward(
         self,
@@ -216,23 +209,13 @@ class DMTDQwen3Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         *,
-        dmtd_shadow_input_ids: torch.Tensor,
-        dmtd_shadow_positions: torch.Tensor,
-        dmtd_shadow_slot_mapping: torch.Tensor | None,
-        dmtd_direct_indices: torch.Tensor,
-        dmtd_seq_req_slots: torch.Tensor,
-        dmtd_seq_phases: torch.Tensor,
+        dmtd_src_index: torch.Tensor,
+        dmtd_buf_index: torch.Tensor,
+        dmtd_add_embed: torch.Tensor,
         dmtd_cycle_hidden: torch.Tensor,
-        dmtd_write_req_slots: torch.Tensor,
-        dmtd_write_phases: torch.Tensor,
-        dmtd_write_shadow_indices: torch.Tensor,
-        dmtd_refresh_input_ids: torch.Tensor | None = None,
-        dmtd_refresh_positions: torch.Tensor | None = None,
-        dmtd_refresh_slot_mapping: torch.Tensor | None = None,
-        dmtd_refresh_attn_metadata: dict[str, Any] | None = None,
-        dmtd_parallel_segments: list[dict[str, Any]] | None = None,
-        dmtd_refresh_segments: list[dict[str, Any]] | None = None,
-        dmtd_history_mode: str = "shadow",
+        dmtd_parallel_hidden: torch.Tensor,
+        dmtd_write_src_index: torch.Tensor,
+        dmtd_write_buf_index: torch.Tensor,
     ) -> torch.Tensor:
         if intermediate_tensors is not None:
             raise ValueError("DMTDQwen3 does not support pipeline parallelism.")
@@ -240,71 +223,37 @@ class DMTDQwen3Model(nn.Module):
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
 
-        parallel_hidden = None
-        if dmtd_shadow_input_ids.numel() > 0:
-            history_mode = dmtd_history_mode or "shadow"
-            two_pass = (
-                history_mode == "real"
-                and dmtd_refresh_input_ids is not None
-                and dmtd_refresh_input_ids.numel() > 0
-            )
-            if two_pass:
-                assert dmtd_refresh_positions is not None
-                if dmtd_refresh_segments:
-                    for seg in dmtd_refresh_segments:
-                        self._run_parallel_layers(
-                            dmtd_refresh_input_ids[seg["start"] : seg["end"]],
-                            dmtd_refresh_positions[seg["start"] : seg["end"]],
-                            slot_mapping=seg["slot_mapping"],
-                            attn_metadata=seg["attn_metadata"],
-                        )
-                else:
-                    self._run_parallel_layers(
-                        dmtd_refresh_input_ids,
-                        dmtd_refresh_positions,
-                        slot_mapping=dmtd_refresh_slot_mapping,
-                        attn_metadata=dmtd_refresh_attn_metadata,
-                    )
+        # Assemble S8's input. The parallel layers already ran (see
+        # `run_parallel_group`) and left their output in `dmtd_parallel_hidden`,
+        # a persistent table with a fixed row range per group. Every scheduled
+        # token therefore takes exactly one row from either that table or the
+        # persistent cycle buffer, chosen by index rather than by boolean mask.
+        #
+        # Nothing below depends on how much parallel work this step did: the
+        # index vectors and both tables have step-independent shapes, and the
+        # two ops are unconditional. That is what lets one captured graph serve
+        # cycle-head and mid-cycle steps alike. Rows that need no work address
+        # scratch entries instead of being dropped from the index vectors.
+        cycle_buffer = dmtd_cycle_hidden.view(-1, dmtd_cycle_hidden.shape[-1])
+        cycle_buffer.index_copy_(
+            0,
+            dmtd_write_buf_index,
+            dmtd_parallel_hidden.index_select(0, dmtd_write_src_index),
+        )
 
-            if dmtd_parallel_segments:
-                pieces: list[torch.Tensor] = []
-                for seg in dmtd_parallel_segments:
-                    pieces.append(
-                        self._run_parallel_layers(
-                            dmtd_shadow_input_ids[seg["start"] : seg["end"]],
-                            dmtd_shadow_positions[seg["start"] : seg["end"]],
-                            slot_mapping=seg["slot_mapping"],
-                            attn_metadata=seg["attn_metadata"],
-                        )
-                    )
-                parallel_hidden = torch.cat(pieces, dim=0)
-            else:
-                parallel_hidden = self._run_parallel_layers(
-                    dmtd_shadow_input_ids,
-                    dmtd_shadow_positions,
-                    slot_mapping=dmtd_shadow_slot_mapping,
-                )
+        # Read after the write above: at a cycle head the token's own hidden is
+        # the row just written, and Norefresh deliberately leaves such tokens
+        # wired to the buffer rather than to the parallel table.
+        hidden_states = cycle_buffer.index_select(0, dmtd_buf_index)
+        hidden_states = torch.where(
+            (dmtd_src_index >= 0).unsqueeze(-1),
+            dmtd_parallel_hidden.index_select(0, dmtd_src_index.clamp(min=0)),
+            hidden_states,
+        )
+        # `add_embed` is 0/1, so this masks the embedding out exactly for prefill
+        # positions without a branch or a boolean-mask (`nonzero`) index.
+        hidden_states = hidden_states + inputs_embeds * dmtd_add_embed.unsqueeze(-1)
 
-            # Only shadow positions are written into the cycle buffer; refresh
-            # hiddens never enter the sequential layers.
-            if dmtd_write_shadow_indices.numel() > 0:
-                dmtd_cycle_hidden[dmtd_write_req_slots, dmtd_write_phases] = (
-                    parallel_hidden[dmtd_write_shadow_indices]
-                )
-
-        sequential_shadow = torch.empty_like(inputs_embeds)
-        direct = dmtd_direct_indices >= 0
-        if direct.any():
-            assert parallel_hidden is not None
-            sequential_shadow[direct] = parallel_hidden[dmtd_direct_indices[direct]]
-        buffered = ~direct
-        if buffered.any():
-            sequential_shadow[buffered] = dmtd_cycle_hidden[
-                dmtd_seq_req_slots[buffered],
-                dmtd_seq_phases[buffered],
-            ]
-
-        hidden_states = inputs_embeds + sequential_shadow
         hidden_states, residual = self._run_layers(
             self.num_parallel_layers,
             self.num_parallel_layers + self.num_sequential_layers,

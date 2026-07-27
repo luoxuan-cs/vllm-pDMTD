@@ -255,17 +255,14 @@ class Scheduler(SchedulerInterface):
                 # anchor itself is the first prediction position (no separate bonus
                 # query), so it needs exactly num_spec_tokens lookahead slots.
                 self.num_lookahead_tokens = self.num_spec_tokens
-        # Refresh (history_mode=real) prefills must not cross a cycle boundary
-        # in a single schedule; Norefresh (shadow) keeps unrestricted chunking.
-        self._dmtd_refresh_cycle_align = False
-        self._dmtd_cycle_length = 0
+        # Prefill never touches the DMTD cycle machinery (it is a plain
+        # vanilla causal forward regardless of history_mode), so prefill
+        # chunk boundaries never need to respect cycle alignment. Only the
+        # decode-phase KV-block reservation below is DMTD-specific.
         if vllm_config.model_config.architecture == "DMTDQwen3ForCausalLM":
             assert speculative_config is None
             hf_config = vllm_config.model_config.hf_config
             self.num_lookahead_tokens = hf_config.mtp_horizon - 1
-            if getattr(hf_config, "dmtd_history_mode", "shadow") == "real":
-                self._dmtd_refresh_cycle_align = True
-                self._dmtd_cycle_length = int(hf_config.mtp_horizon)
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -345,35 +342,6 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
-
-    def _dmtd_refresh_cycle_aligned_split(
-        self,
-        request: Request,
-        num_new_tokens: int,
-        num_computed_tokens: int | None = None,
-    ) -> int:
-        """Clip Refresh prefill so one schedule never crosses a cycle boundary.
-
-        Only active when ``dmtd_history_mode == "real"``. At computed position
-        ``start``, schedule at most through the end of the current cycle
-        (next multiple of ``mtp_horizon``). Decode (past the prompt) is
-        unchanged. Norefresh / non-DMTD schedulers leave ``num_new_tokens`` as-is.
-        """
-        if not self._dmtd_refresh_cycle_align or num_new_tokens <= 0:
-            return num_new_tokens
-        start = (
-            request.num_computed_tokens
-            if num_computed_tokens is None
-            else num_computed_tokens
-        )
-        if start >= request.num_prompt_tokens:
-            return num_new_tokens
-        tau = self._dmtd_cycle_length
-        next_boundary = (start // tau + 1) * tau
-        return min(num_new_tokens, next_boundary - start)
-
-    # Alias kept for call-site clarity in tests / docs.
-    _clip_dmtd_refresh_prefill = _dmtd_refresh_cycle_aligned_split
 
     def _mamba_block_aligned_split(
         self,
@@ -550,10 +518,6 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
-
-            num_new_tokens = self._dmtd_refresh_cycle_aligned_split(
-                request, num_new_tokens
-            )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -915,14 +879,6 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
-
-                num_new_tokens = self._dmtd_refresh_cycle_aligned_split(
-                    request,
-                    num_new_tokens,
-                    num_computed_tokens=num_computed_tokens,
-                )
-                if num_new_tokens == 0:
-                    break
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid

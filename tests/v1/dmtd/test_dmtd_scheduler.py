@@ -105,8 +105,11 @@ def test_dmtd_reserves_cycle_lookahead_without_spec_decode(tmp_path):
 
     assert scheduler.vllm_config.speculative_config is None
     assert scheduler.num_lookahead_tokens == 3
-    assert scheduler.vllm_config.scheduler_config.async_scheduling is False
-    assert scheduler._dmtd_refresh_cycle_align is False
+    # The lookahead reservation comes from the cycle length, not from spec
+    # decode, so it must not drag in spec-decode scheduling behaviour. Async
+    # scheduling is left at the engine default (on), since the cycle planners
+    # decide from token positions only.
+    assert scheduler.vllm_config.scheduler_config.async_scheduling is True
 
     (request,) = create_requests(
         num_requests=1,
@@ -141,11 +144,12 @@ def test_dmtd_rejects_prefix_caching(tmp_path):
         _create_dmtd_scheduler(tmp_path, enable_prefix_caching=True)
 
 
-def test_dmtd_refresh_cycle_aligned_prefill_clips_to_tau(tmp_path):
-    """Refresh history_mode=real: first schedule clips to one cycle (≤4)."""
-    scheduler = _create_dmtd_scheduler(tmp_path, dmtd_history_mode="real")
-    assert scheduler._dmtd_refresh_cycle_align is True
-    assert scheduler._dmtd_cycle_length == 4
+@pytest.mark.parametrize("dmtd_history_mode", ["shadow", "real"])
+def test_dmtd_prefill_is_never_clipped_to_cycle_boundary(tmp_path, dmtd_history_mode):
+    """Prefill is a plain vanilla causal forward regardless of
+    history_mode -- it never touches the cycle/shadow machinery, so a
+    schedule is free to cross as many cycle boundaries as budget allows."""
+    scheduler = _create_dmtd_scheduler(tmp_path, dmtd_history_mode=dmtd_history_mode)
     assert scheduler.num_lookahead_tokens == 3
 
     (request,) = create_requests(
@@ -156,46 +160,4 @@ def test_dmtd_refresh_cycle_aligned_prefill_clips_to_tau(tmp_path):
     scheduler.add_request(request)
     output = scheduler.schedule()
 
-    assert output.num_scheduled_tokens[request.request_id] == 4
-
-
-def test_dmtd_norefresh_does_not_clip_prefill_to_cycle(tmp_path):
-    """Default shadow mode keeps scheduling the full prompt in one chunk."""
-    scheduler = _create_dmtd_scheduler(tmp_path, dmtd_history_mode="shadow")
-    assert scheduler._dmtd_refresh_cycle_align is False
-
-    (request,) = create_requests(
-        num_requests=1,
-        num_tokens=5,
-        block_size=BLOCK_SIZE,
-    )
-    scheduler.add_request(request)
-    output = scheduler.schedule()
-
     assert output.num_scheduled_tokens[request.request_id] == 5
-
-
-@pytest.mark.parametrize(
-    ("prompt_len", "computed", "budget", "expected"),
-    [
-        (5, 0, 8192, 4),
-        (5, 4, 8192, 1),
-        (3, 0, 8192, 3),
-        (8, 0, 2, 2),
-        (8, 3, 8192, 1),
-    ],
-)
-def test_dmtd_refresh_cycle_split_helper(
-    tmp_path, prompt_len, computed, budget, expected
-):
-    scheduler = _create_dmtd_scheduler(tmp_path, dmtd_history_mode="real")
-    (request,) = create_requests(
-        num_requests=1,
-        num_tokens=prompt_len,
-        block_size=BLOCK_SIZE,
-    )
-    request.num_computed_tokens = computed
-    clipped = scheduler._dmtd_refresh_cycle_aligned_split(
-        request, min(prompt_len - computed, budget), num_computed_tokens=computed
-    )
-    assert clipped == expected

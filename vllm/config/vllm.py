@@ -1002,14 +1002,6 @@ class VllmConfig:
                 )
                 self.scheduler_config.async_scheduling = False
             elif (
-                self.model_config is not None
-                and self.model_config.architecture == "DMTDQwen3ForCausalLM"
-            ):
-                logger.debug(
-                    "Disabling asynchronous scheduling for DMTDQwen3 cycle state."
-                )
-                self.scheduler_config.async_scheduling = False
-            elif (
                 self.speculative_config is not None
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)

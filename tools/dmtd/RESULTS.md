@@ -102,6 +102,82 @@ The included four-prompt, 32-output-token-per-prompt benchmark measured:
 This is a correctness-baseline comparison against the intentionally slow
 oracle, not a claim against a standard cached Transformers baseline.
 
+## Compilation optimizations (added later)
+
+CUDA graphs and async scheduling are enabled for DMTD; `torch.compile` remains
+off. See `tools/dmtd/bench_dmtd_ablation.py` and `tools/dmtd/bench_compare.py`.
+
+Everything is captured under `CUDAGraphMode.FULL_DECODE_ONLY` with
+`CompilationMode.NONE`, in two independent families.
+
+The runner's own graph covers the sequential layers plus the assembly in front
+of them. That part is shape-invariant: each scheduled token takes exactly one
+row out of two persistent tables (the cycle buffer and the parallel-output
+table) by index, whether or not the parallel layers ran this step. So one graph
+serves cycle-head and mid-cycle decode steps alike, and
+`DMTDQwen3ModelState.requires_eager_step` only vetoes replay while a request is
+still prefilling.
+
+The parallel layers run before that forward, under graphs the model state owns
+(`capture_extra_graphs` / `DMTDParallelCudaGraphManager`), one family per group.
+This works because a decode cycle head is a *uniform* batch: every participating
+request contributes exactly `DECODE_ROWS_PER_REQ[group]` rows -- `tau` for the
+Norefresh variants and Causal-Refresh's shadow block, `2*tau` for a
+Causal-Refresh cycle, `tau + tau` split across two groups for
+Bidirectional-Refresh. That is the same property DFlash gets from freezing
+`num_query_per_req` at config time, so the existing `uniform_token_count`
+dispatch dimension covers it and no shared descriptor change was needed. Graphs
+are bucketed on the participating-request count and padded up with inert rows
+(`PAD_SLOT_ID`, `seq_len == 0`, flat `query_start_loc`), following DFlash's
+padding recipe.
+
+Two details are load-bearing for correctness:
+
+- Refresh emits its refresh block on every cycle so the shape stays uniform, but
+  on the first cycle -- when there is nothing to overwrite -- those rows have
+  their KV write suppressed. Re-running a position reproduces it only to within
+  bf16 rounding (a different query length makes FlashAttention tile
+  differently), and perturbing prefill's real KV moves later greedy tokens.
+- Padded rows and mid-cycle cycle-buffer writes are aimed at scratch entries: an
+  extra request slot in `cycle_hidden` and an extra row in the parallel-output
+  table. The write vectors are a fixed length so a captured graph copies the
+  same number of rows on every replay.
+
+Fixed 512-token prompt, 256 output tokens, batch 1, one L40S:
+
+| variant | eager | +sequential graphs | +parallel graphs | +async | total |
+| --- | --- | --- | --- | --- | --- |
+| Causal-Parallel-Norefresh | 84.36 | 107.97 | 136.99 | 166.60 | 1.97x |
+| Causal-Parallel-Refresh | 81.29 | 106.70 | 136.88 | 166.17 | 2.04x |
+| Bidirectional-Parallel-Norefresh | 78.99 | 102.56 | 136.32 | 164.18 | 2.08x |
+| Bidirectional-Parallel-Refresh | 55.53 | 69.64 | 101.61 | 118.74 | 2.14x |
+
+Against a Qwen3-4B baseline running everything it supports (including
+`torch.compile`, which DMTD does not):
+
+| model | tok/s | vs Qwen3-4B |
+| --- | --- | --- |
+| Qwen3-4B | 82.68 | 1.00x |
+| Causal-Parallel-Norefresh | 166.59 | 2.01x |
+| Causal-Parallel-Refresh | 165.83 | 2.01x |
+| Bidirectional-Parallel-Norefresh | 164.37 | 1.99x |
+| Bidirectional-Parallel-Refresh | 118.70 | 1.44x |
+
+Greedy token ids are identical between eager, CUDA graph, and async scheduling
+runs for all four variants (`tests/v1/dmtd/test_dmtd_e2e.py`:
+`test_cudagraph_decode_matches_eager`, which also asserts the parallel-layer
+graphs were actually replayed, and
+`test_async_scheduling_matches_sync_scheduling`). They are also identical to the
+pre-optimization engine: `tools/dmtd/smoke_generate.py --expect-json
+tools/dmtd/smoke_backup.json` matches for all four variants in all three modes
+(eager, graphed, graphed + async), and top-5 logprobs match to the bit.
+
+The eager column above is itself faster than before this work (e.g.
+Causal-Parallel-Norefresh 78.35 -> 84.36) because the sequential-layer input is
+now assembled with index-based gathers instead of boolean masking, removing
+about a dozen device synchronizations per step, and because each group's
+attention inputs are now refilled in place instead of reallocated per step.
+
 ## Enabled and constrained features
 
 Enabled and validated:
@@ -114,15 +190,23 @@ Enabled and validated:
 - continuous batching;
 - OpenAI-compatible serving.
 
+- full CUDA graphs for every decode step, covering both the sequential layers
+  and the parallel-layer groups;
+- asynchronous scheduling.
+
 Intentionally disabled until separately validated:
 
 - prefix caching;
 - speculative decoding;
-- asynchronous scheduling;
 - pipeline/context parallelism and dual batch overlap;
 - KV connectors;
 - quantized weight formats;
-- CUDA Graph/`torch.compile`.
+- `torch.compile` (measured at about +5% alone and +1.6% on top of CUDA graphs,
+  so the lowest-value item on the list);
+- CUDA graphs for prefill steps, and for the rare non-uniform decode steps: a
+  multi-token decode, a Refresh request's very first cycle when its prompt is
+  shorter than `tau`, and a mid-cycle resume after a schedule gap. Each falls
+  back to eager for that one step.
 
 Tensor parallel was not run because the host exposes one GPU. No custom kernel
 was added; profiling should precede any kernel work.

@@ -77,6 +77,19 @@ def get_shared_kv_cache_layers(vllm_config: VllmConfig):
     }
 
 
+def get_num_metadata_builders(vllm_config: VllmConfig) -> int:
+    """How many metadata builders each attention group needs.
+
+    More than one is needed when a single step holds several metadata sets live
+    at once, since a builder's persistent scratch is overwritten by its next
+    build. DMTD does: one set for the sequential layers plus one per
+    parallel-layer group (prefill, causal, non-causal).
+    """
+    if vllm_config.model_config.architecture == "DMTDQwen3ForCausalLM":
+        return 4
+    return 1
+
+
 def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -141,11 +154,7 @@ def init_attn_backend(
         if kv_cache_group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
-            num_metadata_builders = (
-                2
-                if vllm_config.model_config.architecture == "DMTDQwen3ForCausalLM"
-                else 1
-            )
+            num_metadata_builders = get_num_metadata_builders(vllm_config)
             group.create_metadata_builders(
                 vllm_config=vllm_config,
                 device=device,

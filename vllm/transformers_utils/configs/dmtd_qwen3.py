@@ -59,17 +59,19 @@ class DMTDQwen3Config(PreTrainedConfig):
                 for i in range(self.num_hidden_layers)
             ]
 
-        if (
-            self.num_parallel_layers != 28
-            or self.num_sequential_layers != 8
-            or self.num_hidden_layers != 36
-        ):
+        if self.num_parallel_layers <= 0 or self.num_sequential_layers <= 0:
             raise ValueError(
-                "DMTDQwen3 requires the checkpoint's 28 parallel / 8 "
-                "sequential layer layout with 36 layers; got "
-                f"{self.num_parallel_layers} parallel / "
-                f"{self.num_sequential_layers} sequential "
-                f"and num_hidden_layers={self.num_hidden_layers}."
+                "num_parallel_layers and num_sequential_layers must both be "
+                f"positive; got {self.num_parallel_layers} parallel / "
+                f"{self.num_sequential_layers} sequential."
+            )
+        total_split = self.num_parallel_layers + self.num_sequential_layers
+        if total_split != self.num_hidden_layers:
+            raise ValueError(
+                "num_parallel_layers + num_sequential_layers must equal "
+                f"num_hidden_layers; got {self.num_parallel_layers} + "
+                f"{self.num_sequential_layers} = {total_split} vs "
+                f"num_hidden_layers={self.num_hidden_layers}."
             )
         if self.mtp_horizon < 1:
             raise ValueError(f"mtp_horizon must be >= 1, got {self.mtp_horizon}.")

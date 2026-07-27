@@ -1,0 +1,194 @@
+{
+  "Causal-Parallel-Norefresh": {
+    "prompt_lens": [
+      5,
+      17
+    ],
+    "token_ids": [
+      [
+        315,
+        3204,
+        5975,
+        13,
+        6771,
+        594,
+        1490,
+        1128,
+        279,
+        3491,
+        374,
+        10161,
+        25,
+        330,
+        3838,
+        374
+      ],
+      [
+        311,
+        279,
+        1429,
+        4185,
+        825,
+        11,
+        323,
+        279,
+        1102,
+        374,
+        429,
+        432,
+        374,
+        279,
+        1429,
+        4185
+      ]
+    ],
+    "texts": [
+      " of possible errors. Let's see what the problem is asking: \"What is",
+      " to the most common one, and the result is that it is the most common"
+    ]
+  },
+  "Causal-Parallel-Refresh": {
+    "prompt_lens": [
+      5,
+      17
+    ],
+    "token_ids": [
+      [
+        315,
+        9472,
+        311,
+        279,
+        315,
+        279,
+        311,
+        279,
+        315,
+        13,
+        315,
+        279,
+        315,
+        13,
+        315,
+        279
+      ],
+      [
+        47116,
+        311,
+        264,
+        1229,
+        47116,
+        13,
+        2055,
+        11,
+        55980,
+        47116,
+        374,
+        279,
+        15279,
+        47116,
+        315,
+        279
+      ]
+    ],
+    "texts": [
+      " of bits to the of the to the of. of the of. of the",
+      " decoding to aning decoding. So, greedy decoding is the parallel decoding of the"
+    ]
+  },
+  "Bidirectional-Parallel-Norefresh": {
+    "prompt_lens": [
+      5,
+      17
+    ],
+    "token_ids": [
+      [
+        11,
+        892,
+        374,
+        264,
+        2409,
+        3484,
+        13,
+        576,
+        3491,
+        374,
+        429,
+        279,
+        6291,
+        374,
+        311,
+        1477
+      ],
+      [
+        311,
+        279,
+        22823,
+        2169,
+        369,
+        279,
+        2661,
+        3491,
+        13,
+        576,
+        3491,
+        374,
+        429,
+        279,
+        6291,
+        374
+      ]
+    ],
+    "texts": [
+      ", which is a big deal. The problem is that the solution is to find",
+      " to the optimal target for the given problem. The problem is that the solution is"
+    ]
+  },
+  "Bidirectional-Parallel-Refresh": {
+    "prompt_lens": [
+      5,
+      17
+    ],
+    "token_ids": [
+      [
+        315,
+        3204,
+        279,
+        1372,
+        315,
+        3204,
+        5302,
+        1372,
+        315,
+        3204,
+        5302,
+        3550,
+        315,
+        279,
+        5302,
+        3550
+      ],
+      [
+        47116,
+        320,
+        374,
+        279,
+        47116,
+        1714,
+        8206,
+        279,
+        47116,
+        12111,
+        429,
+        279,
+        24551,
+        49143,
+        429,
+        279
+      ]
+    ],
+    "texts": [
+      " of possible the number of possible states number of possible states space of the states space",
+      " decoding ( is the decoding methodwhich the decoding algorithm that the decoder selects that the"
+    ]
+  }
+}

@@ -713,6 +713,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.speculator is not None:
                 self.speculator.capture(attn_states)
+            # Graphs the model state owns for work it runs outside the model's
+            # own forward (e.g. DMTD's parallel-layer groups).
+            self.model_state.capture_extra_graphs(
+                self.block_tables, self.attn_groups, self.kv_cache_config
+            )
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1152,6 +1157,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        # Some model states only have graphs for a subset of the work a step can
+        # contain (e.g. DMTD captures mid-cycle decode steps but not the steps
+        # that also run its parallel layers), which the batch shape alone cannot
+        # express. Never vetoes by default.
+        model_state_needs_eager = (
+            not dummy_run
+            and self.model_state.requires_eager_step(scheduler_output, self.req_states)
+        )
+
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1159,7 +1173,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or model_state_needs_eager,
             num_active_loras=num_active_loras,
         )
 

@@ -95,6 +95,33 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
+    def requires_eager_step(
+        self,
+        scheduler_output: Any,
+        req_states: RequestState,
+    ) -> bool:
+        """Whether this step must run eager instead of replaying a CUDA graph.
+
+        Consulted before cudagraph dispatch, for models whose captured graphs
+        only cover a subset of the work a step can contain. The batch shape
+        alone cannot express that subset, so the model state gets to veto
+        replay. No-op (never vetoes) by default."""
+        return False
+
+    def capture_extra_graphs(
+        self,
+        block_tables: Any,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """Capture any CUDA graphs the model state owns itself.
+
+        Called after the main model's capture, for models that run part of a step
+        outside `forward` and so cannot be covered by the runner's graphs -- DMTD
+        captures its parallel-layer groups here. No-op by default.
+        """
+        return None
+
     def preprocess_state(
         self,
         input_batch: InputBatch,
