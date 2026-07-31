@@ -225,6 +225,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
+    VLLM_DMTD_CYCLE_ALIGN: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -1671,6 +1672,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, allows GC to run during capture.
     "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
         int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
+    ),
+    # DMTDQwen3 only. Restrict cycle heads to a global step cadence so that
+    # concurrent requests take their parallel-layer step together, instead of
+    # drifting to independent phases and each paying for its own read of the
+    # parallel layers. Purely a scheduling heuristic; see Scheduler.__init__.
+    "VLLM_DMTD_CYCLE_ALIGN": lambda: bool(
+        int(os.getenv("VLLM_DMTD_CYCLE_ALIGN", "0"))
     ),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),

@@ -45,8 +45,14 @@ class AsyncScheduler(Scheduler):
 
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be
-                # scheduled for decode (for PP microbatching).
-                request.next_decode_eligible_step = self.current_step + self.pp_size
+                # scheduled for decode (for PP microbatching). Both this and any
+                # constraint the base class already recorded (e.g. DMTD's cycle
+                # cadence) are lower bounds on the same field, so keep the later
+                # of the two rather than overwriting.
+                request.next_decode_eligible_step = max(
+                    request.next_decode_eligible_step,
+                    self.current_step + self.pp_size,
+                )
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

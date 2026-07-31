@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -259,10 +260,27 @@ class Scheduler(SchedulerInterface):
         # vanilla causal forward regardless of history_mode), so prefill
         # chunk boundaries never need to respect cycle alignment. Only the
         # decode-phase KV-block reservation below is DMTD-specific.
+        # DMTD cycle-head batching. A request only needs its parallel layers on
+        # a cycle head, and those heads are what make the 28 parallel layers
+        # worth reading: one read serves every participating request's whole
+        # tau-row block. Left alone, concurrent requests drift to independent
+        # phases (they start decoding at different steps), so heads scatter
+        # across nearly every step and each read serves only a fraction of the
+        # batch. Restricting heads to a global step cadence pulls them back
+        # together: a request that reaches a boundary off-cadence waits for the
+        # next cadence step, and from then on its own boundaries land on it.
+        #
+        # This is a scheduling heuristic only. Deferring a decode is something
+        # the scheduler is already free to do, and the cycle planners treat the
+        # result as an ordinary not-scheduled-this-step request, so nothing
+        # about what a head computes changes.
+        self.dmtd_cycle_tau = 0
         if vllm_config.model_config.architecture == "DMTDQwen3ForCausalLM":
             assert speculative_config is None
             hf_config = vllm_config.model_config.hf_config
             self.num_lookahead_tokens = hf_config.mtp_horizon - 1
+            if envs.VLLM_DMTD_CYCLE_ALIGN and vllm_config.use_v2_model_runner:
+                self.dmtd_cycle_tau = hf_config.mtp_horizon
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -1169,6 +1187,39 @@ class Scheduler(SchedulerInterface):
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
 
+    def _defer_dmtd_offcadence_heads(
+        self, num_scheduled_tokens: dict[str, int]
+    ) -> None:
+        """Hold back decodes whose next step would be an off-cadence cycle head.
+
+        Cycle heads are the only steps that read DMTD's parallel layers, and
+        one read serves every request in the head, so heads want to be shared.
+        Steps at a multiple of `tau` are the cadence; a request that would open
+        a cycle off-cadence is made eligible again at the next cadence step, and
+        because its own boundaries then advance in steps of `tau`, it stays on
+        cadence from that point on without further intervention.
+
+        Must be called after `num_computed_tokens` has been advanced for this
+        step, so it reads the position each request would compute *next*.
+        """
+        tau = self.dmtd_cycle_tau
+        next_step = self.current_step + 1
+        if next_step % tau == 0:
+            # The next step is already a cadence step: nothing to hold back.
+            return
+        if len(self.running) < 2:
+            # Nothing to batch with, so waiting would only add latency.
+            return
+        next_cadence_step = -(-next_step // tau) * tau
+        for req_id in num_scheduled_tokens:
+            request = self.requests[req_id]
+            if request.is_prefill_chunk:
+                # Prefill runs as a plain causal forward and never opens a cycle.
+                continue
+            local_pos = request.num_computed_tokens - request.num_prompt_tokens
+            if local_pos >= 0 and local_pos % tau == 0:
+                request.next_decode_eligible_step = next_cadence_step
+
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
@@ -1195,6 +1246,9 @@ class Scheduler(SchedulerInterface):
             # Drop from the in-flight-prefill set once it's no longer prefilling.
             if not request.is_prefill_chunk:
                 self._inflight_prefills.discard(request)
+
+        if self.dmtd_cycle_tau:
+            self._defer_dmtd_offcadence_heads(num_scheduled_tokens)
 
         # Snapshot block IDs for routed experts before forward starts.
         # A concurrent schedule() may preempt requests and free blocks
