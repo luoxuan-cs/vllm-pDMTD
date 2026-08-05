@@ -23,6 +23,10 @@ Point `DMTD_MODEL_PATH` at any DMTD checkpoint:
   (shadow history, bidirectional current shadow cycle)
 - `/workspace/parallel-eval/models/Bidirectional-Parallel-Refresh`
   (real-KV refresh, bidirectional current shadow cycle)
+- `/workspace/parallel-eval/models/Vanilla-DMTD` (the original DMTD of
+  arXiv:2510.11958, i.e. `dmtd_block_attention="none"` with cyclical refilling;
+  the released checkpoint's own `config.json` loads unmodified). Setting
+  `dmtd_history_mode="shadow"` on it gives the no-refilling counterpart.
 
 Example:
 

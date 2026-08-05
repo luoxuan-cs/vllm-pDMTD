@@ -1,6 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native configuration for Parallel DMTD Qwen3 checkpoints."""
+"""Native configuration for DMTD Qwen3 checkpoints.
+
+Two orthogonal axes select the variant:
+
+- ``dmtd_block_attention``: how the ``tau`` slots of the current cycle see each
+  other. ``"causal"``/``"bidirectional"`` are the Parallel variants, which run
+  the parallel layers over a ``[head, MASK, ..., MASK]`` lookahead block.
+  ``"none"`` is the original DMTD of arXiv:2510.11958: no lookahead block at
+  all, so only the cycle head gets a parallel-layer representation and the
+  other ``tau - 1`` positions enter the sequential layers on their own token
+  embedding alone.
+- ``dmtd_history_mode``: ``"real"`` recomputes the skipped positions once per
+  cycle (the paper's cyclical refilling), ``"shadow"`` never does.
+"""
 
 from dataclasses import field
 
@@ -44,10 +57,44 @@ class DMTDQwen3Config(PreTrainedConfig):
     num_sequential_layers: int = 8
     mtp_horizon: int = 4
     mask_token_id: int = 151660
-    dmtd_history_mode: str = "shadow"
-    dmtd_block_attention: str = "causal"
+    # ``None`` means "infer from the checkpoint's field naming" (see
+    # `_resolve_layer_split`): the vanilla DMTD release describes its layer
+    # split with the paper's encoding/thinking/decoding names and carries
+    # neither knob, and it is the "none" + "real" variant.
+    dmtd_history_mode: str | None = None
+    dmtd_block_attention: str | None = None
+
+    # The original DMTD release (xuan-luo/DMTD-Qwen3-4B) names the same split
+    # after the paper's three layer groups. Accepted as aliases so that
+    # checkpoint's own config.json loads unmodified.
+    num_encoding_layers: int | None = None
+    num_thinking_layers: int | None = None
+    num_decoding_layers: int | None = None
+
+    def _resolve_layer_split(self) -> bool:
+        """Fold the paper's layer-group names into P28/S8. Returns whether the
+        config used them, which is also what identifies a vanilla checkpoint."""
+        if self.num_encoding_layers not in (None, 0):
+            raise ValueError(
+                "num_encoding_layers > 0 is not supported: this implementation "
+                "has only parallel (thinking) and sequential (decoding) layer "
+                f"groups; got {self.num_encoding_layers}."
+            )
+        vanilla_naming = (
+            self.num_thinking_layers is not None or self.num_decoding_layers is not None
+        )
+        if self.num_thinking_layers is not None:
+            self.num_parallel_layers = self.num_thinking_layers
+        if self.num_decoding_layers is not None:
+            self.num_sequential_layers = self.num_decoding_layers
+        return vanilla_naming
 
     def __post_init__(self, **kwargs):
+        vanilla_naming = self._resolve_layer_split()
+        if self.dmtd_block_attention is None:
+            self.dmtd_block_attention = "none" if vanilla_naming else "causal"
+        if self.dmtd_history_mode is None:
+            self.dmtd_history_mode = "real" if vanilla_naming else "shadow"
         self.sliding_window = self.sliding_window if self.use_sliding_window else None
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
@@ -85,10 +132,10 @@ class DMTDQwen3Config(PreTrainedConfig):
                 "dmtd_history_mode must be 'shadow' or 'real', got "
                 f"{self.dmtd_history_mode!r}."
             )
-        if self.dmtd_block_attention not in {"causal", "bidirectional"}:
+        if self.dmtd_block_attention not in {"causal", "bidirectional", "none"}:
             raise ValueError(
-                "dmtd_block_attention must be 'causal' or 'bidirectional', got "
-                f"{self.dmtd_block_attention!r}."
+                "dmtd_block_attention must be 'causal', 'bidirectional' or "
+                f"'none', got {self.dmtd_block_attention!r}."
             )
 
         super().__post_init__(**kwargs)

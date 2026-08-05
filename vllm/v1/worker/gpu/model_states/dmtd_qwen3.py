@@ -15,6 +15,10 @@ Semantics (see parallel-eval/models/README.md for the training-side spec):
   generated token of every request is therefore always exactly a fresh cycle
   head (``local_pos == 0``), so there is no "prompt ends mid-cycle" case to
   special-case.
+- ``dmtd_block_attention="none"`` is the original DMTD of arXiv:2510.11958
+  rather than a Parallel variant: a cycle head is the only position that runs
+  P28 at all, and the other ``tau - 1`` positions of the cycle enter S8 on
+  their token embedding alone. See `VanillaCyclePlanner`.
 - All parallel-layer (P28) work for a scheduler step is batched across
   *every* request that needs it this step, grouped by required attention
   treatment (``causal`` vs ``noncausal``), instead of looped one request at a
@@ -80,6 +84,15 @@ class _GroupPlan:
     query_lens: list[int] = field(default_factory=list)
     seq_lens: list[int] = field(default_factory=list)
     positions: list[int] = field(default_factory=list)
+    # Where each row's K/V lands in the KV cache. Equal to `positions` for every
+    # group but a vanilla Norefresh cycle head: there the parallel-layer cache
+    # deliberately lags the sequential one and is kept *contiguous*, because the
+    # positions this variant skips are never written and so must not reserve a
+    # slot either. That is the paged-cache equivalent of the reference
+    # implementation's per-layer-group cache lengths, and it keeps the head's
+    # attention window a gap-free prefix. RoPE still uses `positions`, so keys
+    # carry their true position and relative distances are unchanged.
+    cache_positions: list[int] = field(default_factory=list)
     # -1 => fill with the MASK token; else an absolute position to read the
     # real token id for from this request's full token history.
     token_abs_positions: list[int] = field(default_factory=list)
@@ -97,6 +110,7 @@ class _GroupPlan:
         token_abs_positions: list[int],
         seq_len: int,
         writes_kv: list[bool] | None = None,
+        cache_positions: list[int] | None = None,
     ) -> int:
         """Append one request's contribution; returns its base offset within
         this group's flattened ``positions``."""
@@ -107,6 +121,9 @@ class _GroupPlan:
         self.query_lens.append(len(positions))
         self.seq_lens.append(seq_len)
         self.positions.extend(positions)
+        self.cache_positions.extend(
+            positions if cache_positions is None else cache_positions
+        )
         self.token_abs_positions.extend(token_abs_positions)
         self.writes_kv.extend(
             [True] * len(positions) if writes_kv is None else writes_kv
@@ -461,6 +478,249 @@ class _ParallelGroupBuffers:
             out[num_real_rows:pad_end].fill_(PAD_SLOT_ID)
         self._padded_slot_rows = num_real_rows
         return self.slot_mapping[:, :padded_rows]
+
+
+class VanillaCyclePlanner:
+    """Original DMTD planner (``dmtd_block_attention="none"``).
+
+    The Parallel variants replace the paper's ``⊙ m`` gate with a MASK-token
+    lookahead block, so every slot of a cycle gets its own parallel-layer
+    hidden. This planner is the ungated original (arXiv:2510.11958 §2.2):
+
+        m_i = 1 if local_pos % tau == 0 else 0
+        S8_input_i = embed(x_i) + P28(real sequence)_i * m_i
+
+    so only the cycle head runs the parallel layers, and the other ``tau - 1``
+    positions enter S8 on their token embedding alone. Those positions are
+    wired to the cycle buffer, which this variant never writes and which is
+    therefore all zeros -- that *is* the ``* 0`` above, expressed as an index
+    the shape-invariant forward can gather unconditionally.
+
+    A cycle head runs one causal parallel-layer block. What it spans is the
+    whole difference between the two history modes:
+
+    - ``real`` (cyclical refilling, the paper's inference procedure): the
+      ``tau - 1`` positions the previous cycle skipped, plus the head itself.
+      Their parallel-layer KV was never written, so the block fills the holes
+      with real-token KV and the head then sees a complete history.
+    - ``shadow`` (no refilling): the head alone. The skipped positions stay
+      unwritten, so they must also stay *unaddressed*: the block's rows land at
+      `cache_positions` that pack the head onto the end of the parallel-layer
+      cache instead of at its true position. The head's attention window is
+      then a gap-free prefix holding the prompt plus every earlier head, which
+      is what the reference implementation's lagging per-group cache gives.
+    """
+
+    def __init__(self, state: DMTDQwen3ModelState) -> None:
+        self.state = state
+
+    def _is_head(self, local_pos: int) -> bool:
+        return local_pos % self.state.tau == 0
+
+    def needs_parallel_work(
+        self, *, req_slot: int, start: int, query_len: int
+    ) -> bool:
+        """Mirror of `plan_request`'s early return, without touching any state.
+
+        A step needs the parallel layers exactly when it covers a cycle head;
+        mid-cycle tokens read a zero row and run S8 only.
+        """
+        state = self.state
+        local_start = start - int(state._prompt_len[req_slot])
+        return any(self._is_head(local_start + i) for i in range(query_len))
+
+    def plan_request(
+        self,
+        plan: _CyclePlan,
+        *,
+        batch_idx: int,
+        req_slot: int,
+        start: int,
+        query_len: int,
+        query_start: int,
+    ) -> None:
+        state = self.state
+        prompt_len = int(state._prompt_len[req_slot])
+        tau = state.tau
+        local_start = start - prompt_len
+
+        expected = int(state._next_computed[req_slot])
+        if expected != -1 and start != expected:
+            # A schedule gap (preemption / recompute) means the parallel-layer
+            # cache bookkeeping below no longer describes this request. Rebuild
+            # it from the resumed position: every cycle head strictly before
+            # `local_start` has already run.
+            state._parallel_real_len[req_slot] = self._resume_cache_len(local_start)
+        state._next_computed[req_slot] = start + query_len
+
+        for local_idx, pos in enumerate(range(start, start + query_len)):
+            token_idx = query_start + local_idx
+            plan.seq_req_slots[token_idx] = req_slot
+            # Only ever used to address the cycle buffer, which stays zero here.
+            plan.seq_phases[token_idx] = (pos - prompt_len) % tau
+
+        head_locals = [
+            local_start + i for i in range(query_len) if self._is_head(local_start + i)
+        ]
+        if not head_locals:
+            return
+
+        if state.history_mode == "real":
+            self._plan_refill_heads(
+                plan,
+                batch_idx=batch_idx,
+                req_slot=req_slot,
+                prompt_len=prompt_len,
+                query_start=query_start,
+                local_start=local_start,
+                head_locals=head_locals,
+            )
+        else:
+            self._plan_bare_heads(
+                plan,
+                batch_idx=batch_idx,
+                req_slot=req_slot,
+                prompt_len=prompt_len,
+                query_start=query_start,
+                local_start=local_start,
+                head_locals=head_locals,
+            )
+
+    def _resume_cache_len(self, local_start: int) -> int:
+        """Parallel-layer progress implied by resuming at ``local_start``.
+
+        ``real`` counts local positions whose parallel-layer KV is real,
+        ``shadow`` counts heads written; both are "everything strictly before
+        the resume point that a head would have consolidated".
+        """
+        tau = self.state.tau
+        if local_start <= 0:
+            return 0
+        last_head = ((local_start - 1) // tau) * tau
+        if self.state.history_mode == "real":
+            return last_head + 1
+        return last_head // tau + 1
+
+    def _plan_refill_heads(
+        self,
+        plan: _CyclePlan,
+        *,
+        batch_idx: int,
+        req_slot: int,
+        prompt_len: int,
+        query_start: int,
+        local_start: int,
+        head_locals: list[int],
+    ) -> None:
+        state = self.state
+        tau = state.tau
+        head_local = head_locals[-1]
+        # Everything from the first hole through the head. In steady state the
+        # first hole is `head_local - tau + 1`, which makes this the uniform
+        # `tau`-row batch a captured graph replays. `_parallel_real_len` only
+        # trails further behind after a schedule gap, and only then does the
+        # block grow and the step fall back to eager.
+        filled = int(state._parallel_real_len[req_slot])
+        block_start_local = min(head_local - tau + 1, filled)
+        # Rows before the generation region are prompt positions, kept only so
+        # the first cycle is the same shape as every later one. Their
+        # parallel-layer KV is already real (prefill wrote it) and rewriting it
+        # would perturb it at the ULP level rather than reproduce it, so they
+        # run with their write suppressed.
+        block_start_local = max(block_start_local, -prompt_len)
+        positions = [
+            prompt_len + local
+            for local in range(block_start_local, head_local + 1)
+            if prompt_len + local < state.max_model_len
+        ]
+        if not positions:
+            return
+        writes_kv = [pos - prompt_len >= filled for pos in positions]
+        base = plan.causal.add(
+            batch_idx,
+            positions,
+            list(positions),
+            positions[-1] + 1,
+            writes_kv,
+        )
+        state._parallel_real_len[req_slot] = positions[-1] - prompt_len + 1
+        self._wire_heads(
+            plan,
+            positions=positions,
+            base=base,
+            prompt_len=prompt_len,
+            query_start=query_start,
+            local_start=local_start,
+            head_locals=head_locals,
+        )
+
+    def _plan_bare_heads(
+        self,
+        plan: _CyclePlan,
+        *,
+        batch_idx: int,
+        req_slot: int,
+        prompt_len: int,
+        query_start: int,
+        local_start: int,
+        head_locals: list[int],
+    ) -> None:
+        state = self.state
+        positions = [
+            prompt_len + local
+            for local in head_locals
+            if prompt_len + local < state.max_model_len
+        ]
+        if not positions:
+            return
+        # Heads are consecutive in the packed cache, so a run of them is still
+        # one causal block: row i sits at `seq_len - num_rows + i`, which is
+        # exactly its packed index.
+        written = int(state._parallel_real_len[req_slot])
+        cache_positions = [prompt_len + written + i for i in range(len(positions))]
+        base = plan.causal.add(
+            batch_idx,
+            positions,
+            list(positions),
+            cache_positions[-1] + 1,
+            None,
+            cache_positions,
+        )
+        state._parallel_real_len[req_slot] = written + len(positions)
+        self._wire_heads(
+            plan,
+            positions=positions,
+            base=base,
+            prompt_len=prompt_len,
+            query_start=query_start,
+            local_start=local_start,
+            head_locals=head_locals,
+        )
+
+    @staticmethod
+    def _wire_heads(
+        plan: _CyclePlan,
+        *,
+        positions: list[int],
+        base: int,
+        prompt_len: int,
+        query_start: int,
+        local_start: int,
+        head_locals: list[int],
+    ) -> None:
+        """Point each scheduled head token at its own row of the block.
+
+        Rows that are not heads (refill rows) exist only to fill KV holes;
+        nothing reads their output, so they stay unwired -- and every non-head
+        token keeps the default cycle-buffer (zero) source.
+        """
+        row_of_position = {pos: base + offset for offset, pos in enumerate(positions)}
+        for local in head_locals:
+            row = row_of_position.get(prompt_len + local)
+            if row is None:
+                continue
+            plan.direct_group[query_start + local - local_start] = 0
+            plan.direct_local[query_start + local - local_start] = row
 
 
 class NoRefreshCyclePlanner:
@@ -867,17 +1127,20 @@ class DMTDQwen3ModelState(DefaultModelState):
         self._vectors = _StagedIndexVectors(
             {
                 "prefill_positions": max_padded_tokens,
+                "prefill_cache_positions": max_padded_tokens,
                 "prefill_src_tokens": max_padded_tokens,
                 "prefill_group_req": max_padded_tokens,
                 "prefill_writes_kv": max_padded_tokens,
                 "prefill_req_idx": self.max_num_reqs,
                 "causal_positions": max_group_rows,
+                "causal_cache_positions": max_group_rows,
                 "causal_abs": max_group_rows,
                 "causal_slots": max_group_rows,
                 "causal_group_req": max_group_rows,
                 "causal_writes_kv": max_group_rows,
                 "causal_req_idx": self.max_num_reqs,
                 "noncausal_positions": max_group_rows,
+                "noncausal_cache_positions": max_group_rows,
                 "noncausal_abs": max_group_rows,
                 "noncausal_slots": max_group_rows,
                 "noncausal_group_req": max_group_rows,
@@ -909,7 +1172,14 @@ class DMTDQwen3ModelState(DefaultModelState):
         # Fixed per variant, which is what makes a cycle-head step a uniform
         # batch and so capturable -- the same property DFlash gets from freezing
         # `num_query_per_req` at config time.
-        if self.history_mode == "real":
+        if self.block_attention == "none":
+            # Original DMTD: no lookahead block, so a cycle head is either the
+            # refill block (the tau - 1 skipped positions plus the head) or,
+            # without refilling, the head on its own.
+            self.DECODE_ROWS_PER_REQ = {
+                "causal": self.tau if self.history_mode == "real" else 1
+            }
+        elif self.history_mode == "real":
             if self.block_attention == "bidirectional":
                 # Refresh is a causal continuation of real tokens, the shadow
                 # block is bidirectional within itself, so they need separate
@@ -944,10 +1214,13 @@ class DMTDQwen3ModelState(DefaultModelState):
             layer.self_attn.attn.layer_name
             for layer in layers[: self.num_parallel_layers]
         ]
-        if self.history_mode == "real":
-            self._planner: NoRefreshCyclePlanner | RefreshCyclePlanner = (
-                RefreshCyclePlanner(self)
-            )
+        self._planner: (
+            NoRefreshCyclePlanner | RefreshCyclePlanner | VanillaCyclePlanner
+        )
+        if self.block_attention == "none":
+            self._planner = VanillaCyclePlanner(self)
+        elif self.history_mode == "real":
+            self._planner = RefreshCyclePlanner(self)
         else:
             self._planner = NoRefreshCyclePlanner(self)
 
@@ -1031,6 +1304,7 @@ class DMTDQwen3ModelState(DefaultModelState):
         vectors = self._vectors
         self._group_shapes[kind] = shape
         vectors.stage(f"{kind}_positions", list(group.positions))
+        vectors.stage(f"{kind}_cache_positions", list(group.cache_positions))
         vectors.stage(
             f"{kind}_group_req",
             [
@@ -1259,6 +1533,10 @@ class DMTDQwen3ModelState(DefaultModelState):
                 f"{kind}_positions",
                 group.positions + [0] * (pad_to - len(group.positions)),
             )
+            vectors.stage(
+                f"{kind}_cache_positions",
+                group.cache_positions + [0] * (pad_to - len(group.cache_positions)),
+            )
             vectors.stage(f"{kind}_group_req", expand(group, None, pad_to))
             vectors.stage(f"{kind}_req_idx", list(group.req_batch_indices))
             # Padding rows never write; their slot is PAD_SLOT_ID regardless.
@@ -1317,7 +1595,9 @@ class DMTDQwen3ModelState(DefaultModelState):
             attn_groups[0][0].get_metadata_builder(builder_idx).kv_cache_spec.block_size
         )
         slot_mappings = buffers.fill_slot_mapping(
-            positions=positions,
+            # Where the rows' K/V goes, which is not their RoPE position for a
+            # vanilla Norefresh cycle head (see `_GroupPlan.cache_positions`).
+            positions=vectors.view(f"{kind}_cache_positions"),
             row_group_reqs=vectors.view(f"{kind}_group_req"),
             writes_kv=vectors.view(f"{kind}_writes_kv"),
             block_table=block_table,
@@ -1643,6 +1923,7 @@ class DMTDQwen3ModelState(DefaultModelState):
         for kind in self.PARALLEL_GROUPS:
             self._group_shapes[kind] = _GroupShape(0, 0, False)
             vectors.stage(f"{kind}_positions", [])
+            vectors.stage(f"{kind}_cache_positions", [])
             vectors.stage(f"{kind}_group_req", [])
             vectors.stage(f"{kind}_req_idx", [])
             vectors.stage(f"{kind}_writes_kv", [])

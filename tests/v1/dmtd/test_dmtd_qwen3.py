@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.model_states.dmtd_qwen3 import (
     DMTDQwen3ModelState,
     NoRefreshCyclePlanner,
     RefreshCyclePlanner,
+    VanillaCyclePlanner,
     _ParallelRowLayout,
 )
 
@@ -64,11 +65,12 @@ def _state(
     state.layout = _layout(max_num_reqs)
     state.DECODE_ROWS_PER_REQ = _decode_rows_per_req(block_attention, history_mode)
     state._parallel_graph_managers = {}
-    state._planner = (
-        RefreshCyclePlanner(state)
-        if history_mode == "real"
-        else NoRefreshCyclePlanner(state)
-    )
+    if block_attention == "none":
+        state._planner = VanillaCyclePlanner(state)
+    elif history_mode == "real":
+        state._planner = RefreshCyclePlanner(state)
+    else:
+        state._planner = NoRefreshCyclePlanner(state)
     return state
 
 
@@ -93,6 +95,8 @@ def _layout(max_num_reqs: int) -> _ParallelRowLayout:
 def _decode_rows_per_req(block_attention: str, history_mode: str) -> dict[str, int]:
     """Mirror of `DMTDQwen3ModelState.__init__`'s per-variant row counts, for the
     tests that build a state without running `__init__`."""
+    if block_attention == "none":
+        return {"causal": TAU if history_mode == "real" else 1}
     if history_mode == "real":
         if block_attention == "bidirectional":
             return {"causal": TAU, "noncausal": TAU}
@@ -480,7 +484,7 @@ def test_refresh_mid_cycle_reuses_buffer_without_rerunning_p28():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("block_attention", ["causal", "bidirectional"])
+@pytest.mark.parametrize("block_attention", ["causal", "bidirectional", "none"])
 @pytest.mark.parametrize("history_mode", ["shadow", "real"])
 def test_batching_does_not_change_a_requests_own_plan(block_attention, history_mode):
     def plan_for(batch_reqs, prompt_lens):
@@ -520,7 +524,7 @@ def test_batching_does_not_change_a_requests_own_plan(block_attention, history_m
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("block_attention", ["causal", "bidirectional"])
+@pytest.mark.parametrize("block_attention", ["causal", "bidirectional", "none"])
 @pytest.mark.parametrize("history_mode", ["shadow", "real"])
 def test_decode_cycle_heads_are_uniform_batches(block_attention, history_mode):
     """Every request at a cycle head must contribute exactly
@@ -624,7 +628,7 @@ def test_requires_eager_step_vetoes_prefill_only():
     )
 
 
-@pytest.mark.parametrize("block_attention", ["causal", "bidirectional"])
+@pytest.mark.parametrize("block_attention", ["causal", "bidirectional", "none"])
 @pytest.mark.parametrize("history_mode", ["shadow", "real"])
 def test_needs_parallel_work_agrees_with_planner(block_attention, history_mode):
     """The eager-veto predicate is a hand-mirrored copy of each planner's
@@ -776,3 +780,180 @@ def test_plan_covers_padded_tokens():
     # live request's buffered hidden.
     assert src[1:] == [-1, -1, -1]
     assert buf[1:] == [state.layout.cycle_scratch_row] * 3
+
+
+# --------------------------------------------------------------------------
+# Original DMTD (`dmtd_block_attention="none"`): no MASK lookahead block, so
+# only the cycle head gets a parallel-layer hidden and the rest of the cycle
+# enters S8 on its token embedding alone.
+# --------------------------------------------------------------------------
+
+
+def _rollout(state, prompt_len, num_tokens):
+    """Prefill, then one single-token decode step per generated token."""
+    state._plan_cycle(_batch((0, prompt_len, True)))
+    return [
+        state._plan_cycle(_batch((prompt_len + i, 1, False)))
+        for i in range(num_tokens)
+    ]
+
+
+def test_vanilla_config_naming_of_the_released_checkpoint():
+    """The original release describes its split with the paper's layer-group
+    names and carries neither knob, which is exactly the `none` + `real`
+    variant -- so its own config.json has to load unmodified."""
+    config = _tiny_config(
+        num_encoding_layers=0,
+        num_thinking_layers=28,
+        num_decoding_layers=8,
+    )
+
+    assert config.num_parallel_layers == 28
+    assert config.num_sequential_layers == 8
+    assert config.dmtd_block_attention == "none"
+    assert config.dmtd_history_mode == "real"
+    # An explicit knob still wins over the inferred default.
+    assert (
+        _tiny_config(num_thinking_layers=28, dmtd_history_mode="shadow")
+        .dmtd_history_mode
+        == "shadow"
+    )
+
+
+def test_config_rejects_encoding_layers():
+    """The paper's third layer group has no counterpart here: this
+    implementation is only P28 + S8."""
+    with pytest.raises(ValueError, match="num_encoding_layers"):
+        _tiny_config(num_encoding_layers=2, num_thinking_layers=26)
+
+
+def test_vanilla_leaves_non_causal_off():
+    vllm_config = _mock_vllm_config(_tiny_config(dmtd_block_attention="none"))
+    DMTDQwen3ForCausalLMConfig.verify_and_update_config(vllm_config)
+    assert vllm_config.attention_config.use_non_causal is False
+
+
+@pytest.mark.parametrize("history_mode", ["shadow", "real"])
+def test_vanilla_runs_the_parallel_layers_only_at_cycle_heads(history_mode):
+    """`m_i = 1 if local_pos % tau == 0 else 0`: the cadence the reference
+    implementation writes as `1000 1000 ...`."""
+    prompt_len = 6
+    state = _state(
+        block_attention="none", history_mode=history_mode, prompt_lens=[prompt_len]
+    )
+
+    plans = _rollout(state, prompt_len, 3 * TAU)
+
+    ran_parallel = [bool(plan.causal.positions) for plan in plans]
+    assert ran_parallel == [i % TAU == 0 for i in range(3 * TAU)]
+    # Nothing ever reaches the noncausal group: there is no shadow block.
+    assert all(not plan.noncausal.positions for plan in plans)
+
+
+@pytest.mark.parametrize("history_mode", ["shadow", "real"])
+def test_vanilla_mid_cycle_tokens_read_a_zero_row_and_add_their_embedding(
+    history_mode,
+):
+    """A non-head position's S8 input is `embed(x_i) + 0`. The zero comes from
+    the cycle buffer, which this variant never writes, so the model's
+    unconditional gather stays shape-invariant."""
+    prompt_len = 6
+    state = _state(
+        block_attention="none", history_mode=history_mode, prompt_lens=[prompt_len]
+    )
+
+    plans = _rollout(state, prompt_len, TAU)
+
+    for phase, plan in enumerate(plans):
+        src, buf, add_embed, write_src, write_buf = plan.resolve_gather_indices(
+            state.layout, 1
+        )
+        assert add_embed == [True]
+        if phase == 0:
+            assert src[0] >= 0  # the head reads its own parallel-layer row
+        else:
+            assert src == [-1]  # ... everything else reads the buffer
+            assert buf == [0 * TAU + phase]
+        # No cycle-buffer write on any step, in either mode: the buffer stays
+        # at its initial zeros, which is what makes the read above a `+ 0`.
+        idle_src, idle_buf = _idle_writes(state.layout, 0)
+        assert (write_src, write_buf) == (idle_src, idle_buf)
+        assert plan.write_req_slots == []
+
+
+def test_vanilla_refresh_refills_the_skipped_positions_at_the_next_head():
+    """Cyclical refilling: the `tau - 1` positions the cycle skipped, plus the
+    head itself, recomputed as one causal block of real tokens."""
+    prompt_len = 6
+    state = _state(
+        block_attention="none", history_mode="real", prompt_lens=[prompt_len]
+    )
+
+    plans = _rollout(state, prompt_len, 2 * TAU + 1)
+
+    first, steady = plans[0], plans[TAU]
+    # First head has nothing to refill, so its extra rows are the last prompt
+    # positions, kept only to keep the block a uniform `tau` and inert.
+    assert first.causal.positions == [3, 4, 5, 6]
+    assert first.causal.writes_kv == [False, False, False, True]
+    # Steady head: the previous cycle's skipped positions [7, 8, 9] are holes in
+    # the parallel-layer cache, so they are filled here along with head 10.
+    assert steady.causal.positions == [7, 8, 9, 10]
+    assert steady.causal.writes_kv == [True] * TAU
+    # Real token ids, never MASK, and the window is a gap-free prefix.
+    assert steady.causal.token_abs_positions == [7, 8, 9, 10]
+    assert steady.causal.cache_positions == [7, 8, 9, 10]
+    assert steady.causal.seq_lens == [11]
+    # The head token reads the block's last row, not one of the refill rows.
+    src, _, _, _, _ = steady.resolve_gather_indices(state.layout, 1)
+    assert src == [state.layout.causal_base + TAU - 1]
+
+
+def test_vanilla_norefresh_packs_heads_onto_a_lagging_parallel_cache():
+    """Without refilling, the skipped positions are never written -- so they
+    must not reserve a slot either, or the head would attend to whatever
+    occupies them. Heads pack onto the end of the parallel-layer cache instead,
+    which is the paged equivalent of the reference implementation's lagging
+    per-layer-group cache."""
+    prompt_len = 6
+    state = _state(
+        block_attention="none", history_mode="shadow", prompt_lens=[prompt_len]
+    )
+
+    plans = _rollout(state, prompt_len, 3 * TAU)
+
+    heads = [plans[i * TAU] for i in range(3)]
+    # One row per head, at its true position for RoPE ...
+    assert [head.causal.positions for head in heads] == [[6], [10], [14]]
+    # ... but packed contiguously in the cache, so each head's window is a
+    # gap-free prefix of prompt + every earlier head.
+    assert [head.causal.cache_positions for head in heads] == [[6], [7], [8]]
+    assert [head.causal.seq_lens for head in heads] == [[7], [8], [9]]
+    assert [head.causal.writes_kv for head in heads] == [[True]] * 3
+
+
+def test_vanilla_refresh_leaves_no_hole_in_the_parallel_cache():
+    """The invariant cyclical refilling exists for: by the time a head runs, the
+    parallel-layer cache is a gap-free prefix, so every generated position is
+    written exactly once and the head's own window is complete."""
+    prompt_len = 6
+    state = _state(
+        block_attention="none", history_mode="real", prompt_lens=[prompt_len]
+    )
+
+    written: list[int] = []
+    for plan in _rollout(state, prompt_len, 4 * TAU):
+        group = plan.causal
+        if not group.positions:
+            continue
+        written.extend(
+            pos for pos, writes in zip(group.positions, group.writes_kv) if writes
+        )
+        # The block always ends at the head and reaches back to the first hole.
+        assert group.positions[-1] + 1 == group.seq_lens[0]
+        assert group.positions[-1] - group.positions[0] + 1 == len(group.positions)
+
+    heads = list(range(prompt_len, prompt_len + 4 * TAU, TAU))
+    # Every generated position up to the last head, once each: no hole, no
+    # position written twice (a rewrite would perturb real KV at the ULP level).
+    assert written == list(range(prompt_len, heads[-1] + 1))
